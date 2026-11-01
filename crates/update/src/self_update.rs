@@ -469,8 +469,9 @@ fn replace_appimage(new: &Path, path: &Path) -> Result<(), String> {
 /// beside it: the release's other programs that are already in the executable's folder, and,
 /// when that folder is a prefix's `bin` with the app's `share/<id>` folder next to it, everything
 /// under the tarball's `share` (data, desktop entry, icons). A copy on its own in some folder gets
-/// only its executable. Each file is staged next to its destination and renamed over it; the
-/// executable goes last, so a failure before it leaves the running version in charge.
+/// only its executable. Files the release doesn't ship are never touched. Every file is copied
+/// next to its destination before any is renamed over it, so a copy that fails (full disk,
+/// unwritable folder) changes nothing; the executable is renamed last.
 #[cfg(unix)]
 fn replace_standalone(app: &App, paths: &Paths, tarball: &Path, exe: &Path) -> Result<(), String> {
     let staging = paths.cache.join(format!("{}.standalone", app.id));
@@ -502,16 +503,38 @@ fn replace_from_tree(app: &App, tree: &Path, exe: &Path) -> Result<(), String> {
             moves.push((file.clone(), prefix.join(relative)));
         }
     }
-    for (from, to) in &moves {
-        place(from, to, false)?;
+    moves.push((new_exe, exe.to_path_buf()));
+    // Copy everything next to its destination first, so a full disk or an unwritable folder
+    // stops the update before any installed file changes. Renames within a folder don't fail
+    // for those reasons, and the executable is renamed last.
+    let mut staged = Vec::new();
+    for (i, (from, to)) in moves.iter().enumerate() {
+        match stage(from, to, i == moves.len() - 1) {
+            Ok(s) => staged.push((s, to)),
+            Err(e) => {
+                for (s, _) in &staged {
+                    let _ = std::fs::remove_file(s);
+                }
+                return Err(e);
+            }
+        }
     }
-    place(&new_exe, exe, true)
+    let mut result = Ok(());
+    for (s, to) in &staged {
+        if result.is_ok() {
+            result = std::fs::rename(s, to).map_err(|e| format!("couldn't replace {} ({e})", to.display()));
+        }
+        if result.is_err() {
+            let _ = std::fs::remove_file(s);
+        }
+    }
+    result
 }
 
-/// Copies `from` next to `to` and renames it over `to`. Group and world write and the set-id
-/// bits are never carried over from the archive; the executable is always 0755.
+/// Copies `from` to a hidden file next to `to` and returns its path. Group and world write and
+/// the set-id bits are never carried over from the archive; the executable is always 0755.
 #[cfg(unix)]
-fn place(from: &Path, to: &Path, executable: bool) -> Result<(), String> {
+fn stage(from: &Path, to: &Path, executable: bool) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     let dir = to.parent().ok_or_else(|| format!("{} isn't in a folder", to.display()))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {} ({e})", dir.display()))?;
@@ -520,13 +543,15 @@ fn place(from: &Path, to: &Path, executable: bool) -> Result<(), String> {
     let done = std::fs::copy(from, &staged).map_err(|e| format!("couldn't write next to {} ({e})", to.display())).and_then(|_| {
         let mode = std::fs::metadata(from).map(|m| m.permissions().mode()).unwrap_or(0o644);
         let mode = if executable { 0o755 } else { mode & 0o755 };
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())?;
-        std::fs::rename(&staged, to).map_err(|e| format!("couldn't replace {} ({e})", to.display()))
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())
     });
-    if done.is_err() {
-        let _ = std::fs::remove_file(&staged);
+    match done {
+        Ok(()) => Ok(staged),
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            Err(e)
+        }
     }
-    done
 }
 
 /// A regular file, not a link to one.
@@ -2011,6 +2036,51 @@ mod tests {
         assert_eq!(read("share/applications/ai.storyteller.pdfcraft.desktop"), b"desktop");
         let leftovers: Vec<_> = walk(&prefix).into_iter().filter(|p| p.to_string_lossy().contains(".update")).collect();
         assert!(leftovers.is_empty(), "no staged files left behind: {leftovers:?}");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &str| std::fs::metadata(prefix.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode("bin/pdfcraft"), 0o755);
+        assert_eq!(mode("share/pdfcraft/models/a.rten") & 0o022, 0, "no group or world write from the archive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_folder_stops_the_update_before_anything_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("local");
+        let models = prefix.join("share/pdfcraft/models");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        let exe = prefix.join("bin/pdfcraft");
+        std::fs::write(&exe, b"old app").unwrap();
+        std::fs::write(prefix.join("bin/pdfcraft-cli"), b"old cli").unwrap();
+        std::fs::write(prefix.join("share/pdfcraft/a.txt"), b"old data").unwrap();
+        std::fs::write(models.join("a.rten"), b"old model").unwrap();
+        std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(models.join("probe"), b"").is_ok() {
+            return; // running as root: permissions don't stop writes, so there's nothing to test
+        }
+        let tarball = dir.path().join("new.tar.gz");
+        release_tarball(
+            &tarball,
+            &[
+                ("bin/pdfcraft", b"new app"),
+                ("bin/pdfcraft-cli", b"new cli"),
+                ("share/pdfcraft/a.txt", b"new data"),
+                ("share/pdfcraft/models/a.rten", b"new model"),
+            ],
+        );
+        let paths = Paths::under(&dir.path().join("data"));
+        let result = replace_standalone(&crate::suite::PDFCRAFT, &paths, &tarball, &exe);
+        std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        let read = |p: &str| std::fs::read(prefix.join(p)).unwrap();
+        assert_eq!(read("bin/pdfcraft"), b"old app");
+        assert_eq!(read("bin/pdfcraft-cli"), b"old cli");
+        assert_eq!(read("share/pdfcraft/a.txt"), b"old data", "files staged before the failure aren't put in place");
+        assert_eq!(read("share/pdfcraft/models/a.rten"), b"old model");
+        let leftovers: Vec<_> = walk(&prefix).into_iter().filter(|p| p.to_string_lossy().contains(".update")).collect();
+        assert!(leftovers.is_empty(), "staged files are removed: {leftovers:?}");
     }
 
     #[cfg(unix)]

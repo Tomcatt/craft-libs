@@ -256,4 +256,12 @@ fn the_iso_key_next_to_left_shift_keeps_shift_and_shows_the_layouts_character() 
     // The key's name is no character, so a position that types `I` does not hide the label.
     let typed_i = Layout::new().with_char(Key::IntlBackslash, '<').with_char(Key::Quote, 'I');
     assert_eq!(label(&typed_i, "IntlBackslash", p), "<");
+
+    // UK: the key types `\` and `|`, keys egui has, so it runs the `\` bindings.
+    let uk = Layout::new();
+    let backslash = at("\\", Key::IntlBackslash);
+    let pipe = at("Shift+|", Key::IntlBackslash);
+    assert_eq!(uk.resolve(&backslash), Some(chord("\\")));
+    assert!(uk.matches(&chord("\\"), &backslash, p));
+    assert!(uk.matches(&chord("Shift+\\"), &pipe, p));
 }

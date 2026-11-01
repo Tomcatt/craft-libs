@@ -474,7 +474,8 @@ fn replace_appimage(new: &Path, path: &Path) -> Result<(), String> {
 /// unwritable folder) changes nothing; the executable is renamed last.
 #[cfg(unix)]
 fn replace_standalone(app: &App, paths: &Paths, tarball: &Path, exe: &Path) -> Result<(), String> {
-    let staging = paths.cache.join(format!("{}.standalone", app.id));
+    // Per-process names, so two updates running at once can't remove each other's files.
+    let staging = paths.cache.join(format!("{}.standalone.{}", app.id, std::process::id()));
     let result = install::tree::unpack(app, tarball, &staging).and_then(|tree| replace_from_tree(app, &tree, exe));
     let _ = std::fs::remove_dir_all(&staging);
     result
@@ -504,6 +505,10 @@ fn replace_from_tree(app: &App, tree: &Path, exe: &Path) -> Result<(), String> {
         }
     }
     moves.push((new_exe, exe.to_path_buf()));
+    // A folder where a file goes would fail its rename after earlier files were replaced.
+    if let Some((_, to)) = moves.iter().find(|(_, to)| to.symlink_metadata().is_ok_and(|m| m.is_dir())) {
+        return Err(format!("couldn't replace {} (it's a folder)", to.display()));
+    }
     // Copy everything next to its destination first, so a full disk or an unwritable folder
     // stops the update before any installed file changes. Renames within a folder don't fail
     // for those reasons, and the executable is renamed last.
@@ -539,7 +544,7 @@ fn stage(from: &Path, to: &Path, executable: bool) -> Result<PathBuf, String> {
     let dir = to.parent().ok_or_else(|| format!("{} isn't in a folder", to.display()))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("couldn't create {} ({e})", dir.display()))?;
     let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let staged = dir.join(format!(".{name}.update"));
+    let staged = dir.join(format!(".{name}.{}.update", std::process::id()));
     let done = std::fs::copy(from, &staged).map_err(|e| format!("couldn't write next to {} ({e})", to.display())).and_then(|_| {
         let mode = std::fs::metadata(from).map(|m| m.permissions().mode()).unwrap_or(0o644);
         let mode = if executable { 0o755 } else { mode & 0o755 };
@@ -2081,6 +2086,62 @@ mod tests {
         assert_eq!(read("share/pdfcraft/models/a.rten"), b"old model");
         let leftovers: Vec<_> = walk(&prefix).into_iter().filter(|p| p.to_string_lossy().contains(".update")).collect();
         assert!(leftovers.is_empty(), "staged files are removed: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_where_a_shipped_file_goes_stops_the_update_before_anything_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("local");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("share/pdfcraft/b.txt")).unwrap();
+        let exe = prefix.join("bin/pdfcraft");
+        std::fs::write(&exe, b"old app").unwrap();
+        std::fs::write(prefix.join("share/pdfcraft/a.txt"), b"old a").unwrap();
+        std::fs::write(prefix.join("share/pdfcraft/c.txt"), b"old c").unwrap();
+        let tarball = dir.path().join("new.tar.gz");
+        release_tarball(
+            &tarball,
+            &[
+                ("bin/pdfcraft", b"new app"),
+                ("share/pdfcraft/a.txt", b"new a"),
+                ("share/pdfcraft/b.txt", b"new b"),
+                ("share/pdfcraft/c.txt", b"new c"),
+            ],
+        );
+        let paths = Paths::under(&dir.path().join("data"));
+        let result = replace_standalone(&crate::suite::PDFCRAFT, &paths, &tarball, &exe);
+        assert!(result.is_err());
+        let read = |p: &str| std::fs::read(prefix.join(p)).unwrap();
+        assert_eq!(read("bin/pdfcraft"), b"old app");
+        assert_eq!(read("share/pdfcraft/a.txt"), b"old a", "no file is replaced when one can't be");
+        assert_eq!(read("share/pdfcraft/c.txt"), b"old c", "no file is replaced when one can't be");
+        assert!(prefix.join("share/pdfcraft/b.txt").is_dir());
+        let leftovers: Vec<_> = walk(&prefix).into_iter().filter(|p| p.to_string_lossy().contains(".update")).collect();
+        assert!(leftovers.is_empty(), "staged files are removed: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standalone_update_leaves_another_updates_staged_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("local");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let exe = prefix.join("bin/pdfcraft");
+        std::fs::write(&exe, b"old app").unwrap();
+        // What a concurrent update would have staged under the shared names.
+        let other_file = prefix.join("bin/.pdfcraft.update");
+        std::fs::write(&other_file, b"other update").unwrap();
+        let paths = Paths::under(&dir.path().join("data"));
+        let other_dir = paths.cache.join("pdfcraft.standalone");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(other_dir.join("marker"), b"other update").unwrap();
+        let tarball = dir.path().join("new.tar.gz");
+        release_tarball(&tarball, &[("bin/pdfcraft", b"new app")]);
+        replace_standalone(&crate::suite::PDFCRAFT, &paths, &tarball, &exe).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new app");
+        assert_eq!(std::fs::read(&other_file).unwrap(), b"other update");
+        assert_eq!(std::fs::read(other_dir.join("marker")).unwrap(), b"other update");
     }
 
     #[cfg(unix)]
